@@ -59,6 +59,7 @@ class LineSupervisor:
         self._recover_clock()
 
         self._ledger = GenerationLedger(self._meta)
+        self._ledger.recover(self._stream.visible())
         self._registry = ParameterRegistry(self._stream, self._clock, self._ledger)
         self._board = InterlockBoard(self._stream, self._clock)
         self._tickets = TicketGenerator(self._meta, "cfm")

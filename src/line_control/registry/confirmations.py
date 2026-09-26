@@ -1,8 +1,10 @@
 """Single use, expiring confirmations.
 
 An operator confirmation is only good once, only for the scope it was issued
-for, and only for a limited number of clock ticks.  Stale, expired, unknown
-and already redeemed tickets are refused with distinct codes.
+for, and only for a limited number of clock ticks.  It is also pinned to the
+configuration in effect when it was issued, so any parameter or calibration
+change invalidates it.  Stale, expired, unknown and already redeemed tickets
+are refused with distinct codes.
 """
 
 from __future__ import annotations
@@ -10,7 +12,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any
 
-from line_control.registry.generations import GenerationLedger
+from line_control.registry.generations import CONFIG_GENERATION_FIELD, GenerationLedger
 from line_control.runtime.clock import LogicalClock
 from line_control.runtime.errors import (
     DuplicateRecordError,
@@ -34,6 +36,7 @@ class Confirmation:
     scope: str
     subject: str
     generation: int
+    config_generation: int
     issued_tick: int
     expires_tick: int
     consumed_tick: int | None = None
@@ -59,6 +62,7 @@ class Confirmation:
             "scope": self.scope,
             "subject": self.subject,
             "generation": self.generation,
+            "config_generation": self.config_generation,
             "issued_tick": self.issued_tick,
             "expires_tick": self.expires_tick,
             "consumed_tick": self.consumed_tick,
@@ -90,7 +94,8 @@ class ConfirmationBoard:
             raise ValidationError("confirmation window must be positive")
         ticket = self._tickets.issue()
         issued_tick = self._clock.current
-        generation = 0
+        generation = self._ledger.current(scope)
+        config_generation = self._ledger.configuration()
         record = self._stream.append(
             "confirm.issue",
             scope_key("confirm", ticket),
@@ -101,6 +106,7 @@ class ConfirmationBoard:
                 "issued_tick": issued_tick,
                 "expires_tick": issued_tick + window,
                 "generation": generation,
+                CONFIG_GENERATION_FIELD: config_generation,
             },
             generation=generation,
         )
@@ -110,6 +116,7 @@ class ConfirmationBoard:
             scope=scope,
             subject=subject,
             generation=generation,
+            config_generation=config_generation,
             issued_tick=issued_tick,
             expires_tick=issued_tick + window,
         )
@@ -126,6 +133,7 @@ class ConfirmationBoard:
             scope=str(payload.get("scope", "")),
             subject=str(payload.get("subject", "")),
             generation=int(payload.get("generation", 0)),
+            config_generation=int(payload.get(CONFIG_GENERATION_FIELD, 0)),
             issued_tick=int(payload.get("issued_tick", 0)),
             expires_tick=int(payload.get("expires_tick", 0)),
             consumed_tick=payload.get("consumed_tick"),
@@ -145,6 +153,8 @@ class ConfirmationBoard:
                 confirmation.revoked
                 or confirmation.is_consumed()
                 or confirmation.is_expired(self._clock.current)
+                or confirmation.generation != self._ledger.current(confirmation.scope)
+                or confirmation.config_generation != self._ledger.configuration()
             ):
                 continue
             out.append(confirmation)
@@ -183,20 +193,67 @@ class ConfirmationBoard:
                 expires_tick=confirmation.expires_tick,
                 tick=self._clock.current,
             )
-        current = confirmation.generation
-        if confirmation.generation != current:
+        current_scope = self._ledger.current(confirmation.scope)
+        if confirmation.generation != current_scope:
             raise StaleCredentialError(
                 f"confirmation {ticket} belongs to an older generation",
                 ticket=ticket,
                 confirmation_generation=confirmation.generation,
-                current_generation=current,
+                current_generation=current_scope,
+            )
+        current_configuration = self._ledger.configuration()
+        if confirmation.config_generation != current_configuration:
+            raise StaleCredentialError(
+                f"confirmation {ticket} predates a configuration change",
+                ticket=ticket,
+                confirmation_config_generation=confirmation.config_generation,
+                current_config_generation=current_configuration,
             )
         return confirmation
 
     def consume(self, ticket: str, subject: str | None = None) -> Confirmation:
         """Redeem a confirmation exactly once."""
-        confirmation = self.assert_usable(ticket, subject)
+        self.assert_usable(ticket, subject)
+        return self._consume(ticket, subject)
+
+    def _consume(self, ticket: str, subject: str | None) -> Confirmation:
+        """Validate lifetime fields, then append a consumption record."""
+        confirmation = self.read(ticket)
+        if confirmation is None:
+            raise UnknownReferenceError(
+                f"confirmation {ticket} was never issued", ticket=ticket
+            )
+        if subject is not None and confirmation.subject != subject:
+            raise UnknownReferenceError(
+                f"confirmation {ticket} was issued for another subject",
+                ticket=ticket,
+                expected=subject,
+                found=confirmation.subject,
+            )
+        if confirmation.is_consumed():
+            raise DuplicateRecordError(
+                f"confirmation {ticket} was already redeemed",
+                ticket=ticket,
+                consumed_tick=confirmation.consumed_tick,
+            )
+        if confirmation.revoked:
+            raise StaleCredentialError(
+                f"confirmation {ticket} was withdrawn",
+                ticket=ticket,
+            )
+        if confirmation.is_expired(self._clock.current):
+            raise ExpiredCredentialError(
+                f"confirmation {ticket} outlived its window",
+                ticket=ticket,
+                expires_tick=confirmation.expires_tick,
+                tick=self._clock.current,
+            )
+
         consumed_tick = self._clock.tick()
+        current_scope = self._ledger.current(confirmation.scope)
+        current_configuration = self._ledger.configuration()
+        generation = current_scope
+        config_generation = current_configuration
         record = self._stream.append(
             "confirm.consume",
             scope_key("confirm", ticket),
@@ -207,20 +264,28 @@ class ConfirmationBoard:
                 "issued_tick": confirmation.issued_tick,
                 "expires_tick": confirmation.expires_tick,
                 "consumed_tick": consumed_tick,
-                "generation": confirmation.generation,
+                "generation": generation,
+                CONFIG_GENERATION_FIELD: config_generation,
             },
-            generation=confirmation.generation,
+            generation=generation,
         )
         self._stream.commit_upto(record.seq)
         return Confirmation(
             ticket=confirmation.ticket,
             scope=confirmation.scope,
             subject=confirmation.subject,
-            generation=confirmation.generation,
+            generation=generation,
+            config_generation=config_generation,
             issued_tick=confirmation.issued_tick,
             expires_tick=confirmation.expires_tick,
             consumed_tick=consumed_tick,
         )
+
+    def consume_for_configuration_change(
+        self, ticket: str, subject: str | None = None
+    ) -> Confirmation:
+        """Redeem authorisation immediately before its configuration change."""
+        return self._consume(ticket, subject)
 
     def reissue(self, ticket: str, window: int = DEFAULT_WINDOW) -> Confirmation:
         """Withdraw a confirmation and hand out a fresh ticket in the same scope."""
@@ -237,6 +302,7 @@ class ConfirmationBoard:
                 "scope": previous.scope,
                 "subject": previous.subject,
                 "generation": previous.generation,
+                CONFIG_GENERATION_FIELD: previous.config_generation,
                 "issued_tick": previous.issued_tick,
                 "expires_tick": previous.expires_tick,
                 "revoked": True,

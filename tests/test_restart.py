@@ -150,6 +150,54 @@ def test_restart_keeps_the_confirmation_counter_moving_forward(tmp_path) -> None
     assert reopened.confirmations.read(issued) is not None
 
 
+def test_restart_keeps_a_confirmation_invalid_after_a_parameter_change(tmp_path) -> None:
+    first = open_line(tmp_path)
+    first.register_unit("u1")
+    ticket = feed_ticket(first)
+    first.compressor.set_max_load("u1", 72)
+
+    reopened = open_line(tmp_path)
+
+    with pytest.raises(StaleCredentialError):
+        reopened.confirmations.assert_usable(ticket)
+
+
+def test_restart_keeps_a_confirmation_invalid_after_recalibration(tmp_path) -> None:
+    from line_control.registry.baselines import CurvePoint
+    from tests.support import recalibrate_ticket
+
+    first = open_line(tmp_path)
+    first.register_unit("u1")
+    ticket = feed_ticket(first)
+    first.compressor.recalibrate(
+        "u1",
+        recalibrate_ticket(first),
+        [CurvePoint(0, 0.60), CurvePoint(100, 0.90)],
+    )
+
+    reopened = open_line(tmp_path)
+
+    with pytest.raises(StaleCredentialError):
+        reopened.confirmations.assert_usable(ticket)
+
+
+def test_restart_keeps_the_replacement_calibration_for_bleed_protection(tmp_path) -> None:
+    from line_control.registry.baselines import CurvePoint
+    from tests.support import recalibrate_ticket
+
+    first = open_line(tmp_path)
+    first.register_unit("u1")
+    first.compressor.recalibrate(
+        "u1",
+        recalibrate_ticket(first),
+        [CurvePoint(0, 0.60), CurvePoint(100, 0.90)],
+    )
+
+    reopened = open_line(tmp_path)
+
+    assert reopened.bleed.guard_margin("u1", 0) == pytest.approx(0.10)
+
+
 def test_corrupt_log_line_blocks_the_restart(tmp_path) -> None:
     from line_control.runtime.errors import StreamIntegrityError
 

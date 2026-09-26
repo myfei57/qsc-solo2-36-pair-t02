@@ -161,8 +161,9 @@ class CompressorController:
     def recalibrate(self, unit: str, ticket: str, raw_points: Iterable[Any]) -> Baseline:
         """Replace the baseline, stamping it with a new generation."""
         points: Sequence[CurvePoint] = normalise_points(raw_points)
-        self._confirmations.consume(ticket, subject=RECALIBRATE_SUBJECT)
-        self._registry.bump(self.scope(unit))
+        self._confirmations.consume_for_configuration_change(
+            ticket, subject=RECALIBRATE_SUBJECT
+        )
         return self._baselines.publish(BASELINE_NAME, self.scope(unit), points)
 
     def retire_calibration(self, unit: str) -> int:

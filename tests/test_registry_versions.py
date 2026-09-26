@@ -13,7 +13,7 @@ from line_control.runtime.errors import (
     ValidationError,
 )
 
-from tests.support import feed_ticket, recalibrate_ticket
+from tests.support import feed_ticket, prime_for_feed, recalibrate_ticket
 
 
 def test_parameter_write_is_stamped_with_the_scope_generation(unit, line) -> None:
@@ -91,6 +91,65 @@ def test_confirmation_is_refused_after_the_scope_generation_moves(unit, line) ->
 
     with pytest.raises(StaleCredentialError):
         line.confirmations.assert_usable(ticket)
+
+
+def test_any_parameter_change_invalidates_an_outstanding_confirmation(unit, line) -> None:
+    ticket = feed_ticket(line)
+
+    line.compressor.set_max_load(unit, 72)
+
+    with pytest.raises(StaleCredentialError):
+        line.confirmations.assert_usable(ticket)
+
+
+def test_a_parameter_change_keeps_an_old_confirmation_from_opening_the_valve(
+    unit, line
+) -> None:
+    ticket = feed_ticket(line)
+    prime_for_feed(line, unit)
+    line.compressor.set_max_load(unit, 72)
+
+    with pytest.raises(StaleCredentialError):
+        line.open_feed(unit, ticket)
+
+    assert line.feed.valve_open(unit) is False
+
+
+def test_recalibration_invalidates_confirmations_issued_before_it(unit, line) -> None:
+    feed = feed_ticket(line)
+    calibration = recalibrate_ticket(line)
+
+    line.compressor.recalibrate(
+        unit,
+        calibration,
+        [CurvePoint(0, 0.60), CurvePoint(100, 0.90)],
+    )
+
+    with pytest.raises(StaleCredentialError):
+        line.confirmations.assert_usable(feed)
+
+
+def test_bleed_protection_uses_the_replacement_calibration(unit, line) -> None:
+    old_margin = line.bleed.guard_margin(unit, 0)
+
+    line.compressor.recalibrate(
+        unit,
+        recalibrate_ticket(line),
+        [CurvePoint(0, 0.60), CurvePoint(100, 0.80)],
+    )
+
+    assert line.bleed.guard_margin(unit, 0) == pytest.approx(0.10)
+    assert line.bleed.guard_margin(unit, 0) != old_margin
+
+
+def test_a_fresh_confirmation_is_accepted_after_configuration_changes(unit, line) -> None:
+    old_ticket = feed_ticket(line)
+    line.compressor.set_margin_floor(unit, 0.1)
+    replacement = feed_ticket(line)
+
+    with pytest.raises(StaleCredentialError):
+        line.confirmations.assert_usable(old_ticket)
+    assert line.confirmations.assert_usable(replacement).subject == "feed.open"
 
 
 def test_confirmation_issued_for_another_subject_is_refused(line) -> None:

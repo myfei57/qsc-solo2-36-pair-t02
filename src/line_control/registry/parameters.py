@@ -1,9 +1,10 @@
 """Generational parameter registry.
 
 Parameters live in the append only stream, so a value only becomes visible
-once its write is committed.  Every change is stamped with the generation of
-its scope, and a snapshot taken at generation *n* is refused once the scope
-moves past *n*.
+once its write is committed.  Every successful write advances the durable
+configuration generation, invalidating operator confirmations issued before
+it.  Explicit scope bumps also advance that scope's generation, and a snapshot
+taken at generation *n* is refused once the scope moves past *n*.
 """
 
 from __future__ import annotations
@@ -11,7 +12,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Any, Mapping
 
-from line_control.registry.generations import GenerationLedger
+from line_control.registry.generations import CONFIG_GENERATION_FIELD, GenerationLedger
 from line_control.runtime.clock import LogicalClock
 from line_control.runtime.errors import (
     StaleCredentialError,
@@ -194,44 +195,67 @@ class ParameterRegistry:
 
     # ----------------------------------------------------------- write paths
     def set(self, scope: str, name: str, value: Any) -> Parameter:
-        """Store a new value and make it visible in one commit."""
+        """Store a new value, bump configuration, and commit both."""
         spec = self.spec(scope, name)
         coerced = self._coerce(spec, value)
-        generation = 0
+        generation = self._ledger.current(scope)
+        config_generation = self._ledger.bump_configuration()
         record = self._stream.append(
             "param.set",
             spec.key(),
-            {"scope": scope, "name": name, "value": coerced, "kind": spec.kind},
+            {
+                "scope": scope,
+                "name": name,
+                "value": coerced,
+                "kind": spec.kind,
+                CONFIG_GENERATION_FIELD: config_generation,
+            },
             generation=generation,
         )
         self._stream.commit_upto(record.seq)
         return Parameter(scope, name, coerced, generation, record.tick)
 
     def set_many(self, scope: str, values: Mapping[str, Any]) -> int:
-        """Store several values in one commit."""
-        generation = 0
-        last = 0
+        """Store several values in one configuration generation and commit."""
+        pending = []
         for name, raw in sorted(values.items()):
             spec = self.spec(scope, name)
-            coerced = self._coerce(spec, raw)
+            pending.append((spec, self._coerce(spec, raw)))
+        if not pending:
+            return 0
+
+        generation = self._ledger.current(scope)
+        config_generation = self._ledger.bump_configuration()
+        last = 0
+        for spec, coerced in pending:
             record = self._stream.append(
                 "param.set",
                 spec.key(),
-                {"scope": scope, "name": name, "value": coerced, "kind": spec.kind},
+                {
+                    "scope": scope,
+                    "name": spec.name,
+                    "value": coerced,
+                    "kind": spec.kind,
+                    CONFIG_GENERATION_FIELD: config_generation,
+                },
                 generation=generation,
             )
             last = record.seq
-        if last:
-            self._stream.commit_upto(last)
+        self._stream.commit_upto(last)
         return last
 
     def bump(self, scope: str) -> int:
         """Advance the scope generation, invalidating older artefacts."""
         generation = self._ledger.bump(scope)
+        config_generation = self._ledger.bump_configuration()
         record = self._stream.append(
             "param.epoch",
             scope_key("epoch", scope),
-            {"scope": scope, "generation": generation},
+            {
+                "scope": scope,
+                "generation": generation,
+                CONFIG_GENERATION_FIELD: config_generation,
+            },
             generation=generation,
         )
         self._stream.commit_upto(record.seq)
@@ -242,7 +266,7 @@ class ParameterRegistry:
         """Capture every effective value in one scope."""
         return ParameterSnapshot(
             scope=scope,
-            generation=0,
+            generation=self._ledger.current(scope),
             tick=self._clock.current,
             values=self.values(scope),
         )
@@ -250,26 +274,37 @@ class ParameterRegistry:
     def restore(self, snapshot: ParameterSnapshot) -> int:
         """Reapply a snapshot, refusing one the scope has moved past."""
         self.assert_fresh(snapshot)
-        last = 0
+        pending = []
         for name, raw in sorted(snapshot.values.items()):
             spec = self._specs.get((snapshot.scope, name))
             if spec is None:
                 continue
-            coerced = self._coerce(spec, raw)
+            pending.append((spec, self._coerce(spec, raw)))
+        if not pending:
+            return 0
+
+        generation = self._ledger.current(snapshot.scope)
+        config_generation = self._ledger.bump_configuration()
+        last = 0
+        for spec, coerced in pending:
             record = self._stream.append(
                 "param.restore",
                 spec.key(),
-                {"scope": snapshot.scope, "name": name, "value": coerced},
-                generation=snapshot.generation,
+                {
+                    "scope": snapshot.scope,
+                    "name": spec.name,
+                    "value": coerced,
+                    CONFIG_GENERATION_FIELD: config_generation,
+                },
+                generation=generation,
             )
             last = record.seq
-        if last:
-            self._stream.commit_upto(last)
+        self._stream.commit_upto(last)
         return last
 
     def assert_fresh(self, snapshot: ParameterSnapshot) -> None:
         """Refuse a snapshot that belongs to an older generation."""
-        current = snapshot.generation
+        current = self._ledger.current(snapshot.scope)
         if snapshot.is_stale(current):
             raise StaleCredentialError(
                 f"snapshot for scope {snapshot.scope} is stale",

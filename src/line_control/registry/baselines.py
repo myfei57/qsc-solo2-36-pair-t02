@@ -11,7 +11,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any, Iterable, Sequence
 
-from line_control.registry.generations import GenerationLedger
+from line_control.registry.generations import CONFIG_GENERATION_FIELD, GenerationLedger
 from line_control.runtime.clock import LogicalClock
 from line_control.runtime.errors import (
     StaleCredentialError,
@@ -116,7 +116,12 @@ class BaselineBook:
                 "a baseline needs at least two points", name=name, scope=scope
             )
         normalised.sort(key=lambda point: point.load)
-        generation = 0
+        if self.read(scope, name) is not None:
+            generation = self._ledger.bump(scope)
+            config_generation = self._ledger.bump_configuration()
+        else:
+            generation = self._ledger.current(scope)
+            config_generation = self._ledger.configuration()
         record = self._stream.append(
             "baseline.publish",
             scope_key("baseline", scope, name),
@@ -124,6 +129,7 @@ class BaselineBook:
                 "name": name,
                 "scope": scope,
                 "points": [point.to_dict() for point in normalised],
+                CONFIG_GENERATION_FIELD: config_generation,
             },
             generation=generation,
         )
@@ -162,7 +168,7 @@ class BaselineBook:
                 name=name,
                 scope=scope,
             )
-        current = baseline.generation
+        current = self._ledger.current(scope)
         if baseline.is_stale(current):
             raise StaleCredentialError(
                 f"baseline {name} is stale for scope {scope}",
