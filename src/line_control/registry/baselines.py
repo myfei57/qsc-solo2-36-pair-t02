@@ -116,7 +116,7 @@ class BaselineBook:
                 "a baseline needs at least two points", name=name, scope=scope
             )
         normalised.sort(key=lambda point: point.load)
-        generation = 0
+        generation = self._ledger.current(scope)
         record = self._stream.append(
             "baseline.publish",
             scope_key("baseline", scope, name),
@@ -124,6 +124,7 @@ class BaselineBook:
                 "name": name,
                 "scope": scope,
                 "points": [point.to_dict() for point in normalised],
+                "generation": generation,
             },
             generation=generation,
         )
@@ -162,7 +163,7 @@ class BaselineBook:
                 name=name,
                 scope=scope,
             )
-        current = baseline.generation
+        current = self._ledger.current(scope)
         if baseline.is_stale(current):
             raise StaleCredentialError(
                 f"baseline {name} is stale for scope {scope}",

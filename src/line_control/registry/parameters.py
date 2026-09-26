@@ -192,24 +192,39 @@ class ParameterRegistry:
         """Return the generation the scope currently carries."""
         return self._ledger.current(scope)
 
+    def revision(self, scope: str) -> int:
+        """Return the change count the scope currently carries."""
+        return self._ledger.revision(scope)
+
     # ----------------------------------------------------------- write paths
     def set(self, scope: str, name: str, value: Any) -> Parameter:
-        """Store a new value and make it visible in one commit."""
+        """Store a new value and make it visible in one commit.
+
+        Every committed write carries the current epoch and advances the scope
+        revision, which withdraws confirmations issued before the write.
+        """
         spec = self.spec(scope, name)
         coerced = self._coerce(spec, value)
-        generation = 0
+        generation = self._ledger.current(scope)
         record = self._stream.append(
             "param.set",
             spec.key(),
-            {"scope": scope, "name": name, "value": coerced, "kind": spec.kind},
+            {
+                "scope": scope,
+                "name": name,
+                "value": coerced,
+                "kind": spec.kind,
+                "generation": generation,
+            },
             generation=generation,
         )
         self._stream.commit_upto(record.seq)
+        self._ledger.mark_changed(scope)
         return Parameter(scope, name, coerced, generation, record.tick)
 
     def set_many(self, scope: str, values: Mapping[str, Any]) -> int:
-        """Store several values in one commit."""
-        generation = 0
+        """Store several values in one commit and advance the revision once."""
+        generation = self._ledger.current(scope)
         last = 0
         for name, raw in sorted(values.items()):
             spec = self.spec(scope, name)
@@ -217,12 +232,19 @@ class ParameterRegistry:
             record = self._stream.append(
                 "param.set",
                 spec.key(),
-                {"scope": scope, "name": name, "value": coerced, "kind": spec.kind},
+                {
+                    "scope": scope,
+                    "name": name,
+                    "value": coerced,
+                    "kind": spec.kind,
+                    "generation": generation,
+                },
                 generation=generation,
             )
             last = record.seq
         if last:
             self._stream.commit_upto(last)
+            self._ledger.mark_changed(scope)
         return last
 
     def bump(self, scope: str) -> int:
@@ -242,7 +264,7 @@ class ParameterRegistry:
         """Capture every effective value in one scope."""
         return ParameterSnapshot(
             scope=scope,
-            generation=0,
+            generation=self._ledger.current(scope),
             tick=self._clock.current,
             values=self.values(scope),
         )
@@ -250,6 +272,7 @@ class ParameterRegistry:
     def restore(self, snapshot: ParameterSnapshot) -> int:
         """Reapply a snapshot, refusing one the scope has moved past."""
         self.assert_fresh(snapshot)
+        generation = self._ledger.current(snapshot.scope)
         last = 0
         for name, raw in sorted(snapshot.values.items()):
             spec = self._specs.get((snapshot.scope, name))
@@ -259,17 +282,23 @@ class ParameterRegistry:
             record = self._stream.append(
                 "param.restore",
                 spec.key(),
-                {"scope": snapshot.scope, "name": name, "value": coerced},
-                generation=snapshot.generation,
+                {
+                    "scope": snapshot.scope,
+                    "name": name,
+                    "value": coerced,
+                    "generation": generation,
+                },
+                generation=generation,
             )
             last = record.seq
         if last:
             self._stream.commit_upto(last)
+            self._ledger.mark_changed(snapshot.scope)
         return last
 
     def assert_fresh(self, snapshot: ParameterSnapshot) -> None:
         """Refuse a snapshot that belongs to an older generation."""
-        current = snapshot.generation
+        current = self._ledger.current(snapshot.scope)
         if snapshot.is_stale(current):
             raise StaleCredentialError(
                 f"snapshot for scope {snapshot.scope} is stale",

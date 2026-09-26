@@ -1,8 +1,11 @@
 """Single use, expiring confirmations.
 
 An operator confirmation is only good once, only for the scope it was issued
-for, and only for a limited number of clock ticks.  Stale, expired, unknown
-and already redeemed tickets are refused with distinct codes.
+for, and only for a limited number of clock ticks.  It is also pinned to the
+generation and the revision its scope carried when it was issued: a parameter
+write or a generation bump withdraws every confirmation that predates it, and
+that withdrawal survives a restart.  Stale, expired, unknown and already
+redeemed tickets are refused with distinct codes.
 """
 
 from __future__ import annotations
@@ -38,6 +41,7 @@ class Confirmation:
     expires_tick: int
     consumed_tick: int | None = None
     revoked: bool = False
+    revision: int = 0
 
     @property
     def key(self) -> str:
@@ -59,6 +63,7 @@ class Confirmation:
             "scope": self.scope,
             "subject": self.subject,
             "generation": self.generation,
+            "revision": self.revision,
             "issued_tick": self.issued_tick,
             "expires_tick": self.expires_tick,
             "consumed_tick": self.consumed_tick,
@@ -90,7 +95,8 @@ class ConfirmationBoard:
             raise ValidationError("confirmation window must be positive")
         ticket = self._tickets.issue()
         issued_tick = self._clock.current
-        generation = 0
+        generation = self._ledger.current(scope)
+        revision = self._ledger.revision(scope)
         record = self._stream.append(
             "confirm.issue",
             scope_key("confirm", ticket),
@@ -101,6 +107,7 @@ class ConfirmationBoard:
                 "issued_tick": issued_tick,
                 "expires_tick": issued_tick + window,
                 "generation": generation,
+                "revision": revision,
             },
             generation=generation,
         )
@@ -112,6 +119,7 @@ class ConfirmationBoard:
             generation=generation,
             issued_tick=issued_tick,
             expires_tick=issued_tick + window,
+            revision=revision,
         )
 
     # ---------------------------------------------------------------- reading
@@ -130,10 +138,11 @@ class ConfirmationBoard:
             expires_tick=int(payload.get("expires_tick", 0)),
             consumed_tick=payload.get("consumed_tick"),
             revoked=bool(payload.get("revoked", False)),
+            revision=int(payload.get("revision", 0)),
         )
 
     def outstanding(self, scope: str | None = None) -> list[Confirmation]:
-        """Return confirmations that are neither consumed nor expired."""
+        """Return confirmations that are neither consumed, expired nor stale."""
         out: list[Confirmation] = []
         for record in self._stream.visible("confirm.issue"):
             confirmation = self.read(str(record.payload.get("ticket", "")))
@@ -145,10 +154,18 @@ class ConfirmationBoard:
                 confirmation.revoked
                 or confirmation.is_consumed()
                 or confirmation.is_expired(self._clock.current)
+                or self._is_stale(confirmation)
             ):
                 continue
             out.append(confirmation)
         return out
+
+    def _is_stale(self, confirmation: Confirmation) -> bool:
+        """Report whether the scope moved after the confirmation was issued."""
+        return (
+            confirmation.generation != self._ledger.current(confirmation.scope)
+            or confirmation.revision != self._ledger.revision(confirmation.scope)
+        )
 
     # -------------------------------------------------------------- redeeming
     def assert_usable(self, ticket: str, subject: str | None = None) -> Confirmation:
@@ -183,13 +200,16 @@ class ConfirmationBoard:
                 expires_tick=confirmation.expires_tick,
                 tick=self._clock.current,
             )
-        current = confirmation.generation
-        if confirmation.generation != current:
+        current_generation = self._ledger.current(confirmation.scope)
+        current_revision = self._ledger.revision(confirmation.scope)
+        if self._is_stale(confirmation):
             raise StaleCredentialError(
-                f"confirmation {ticket} belongs to an older generation",
+                f"confirmation {ticket} belongs to an older configuration",
                 ticket=ticket,
                 confirmation_generation=confirmation.generation,
-                current_generation=current,
+                current_generation=current_generation,
+                confirmation_revision=confirmation.revision,
+                current_revision=current_revision,
             )
         return confirmation
 
@@ -208,6 +228,7 @@ class ConfirmationBoard:
                 "expires_tick": confirmation.expires_tick,
                 "consumed_tick": consumed_tick,
                 "generation": confirmation.generation,
+                "revision": confirmation.revision,
             },
             generation=confirmation.generation,
         )
@@ -220,6 +241,7 @@ class ConfirmationBoard:
             issued_tick=confirmation.issued_tick,
             expires_tick=confirmation.expires_tick,
             consumed_tick=consumed_tick,
+            revision=confirmation.revision,
         )
 
     def reissue(self, ticket: str, window: int = DEFAULT_WINDOW) -> Confirmation:
@@ -237,6 +259,7 @@ class ConfirmationBoard:
                 "scope": previous.scope,
                 "subject": previous.subject,
                 "generation": previous.generation,
+                "revision": previous.revision,
                 "issued_tick": previous.issued_tick,
                 "expires_tick": previous.expires_tick,
                 "revoked": True,

@@ -110,6 +110,9 @@ class LineSupervisor:
         self._declare_gates()
         self._declare_tables()
         self._redeclare_units()
+        # Links have to exist before recovery so follower revisions are
+        # reconstructed too; the committed stream is the authority.
+        self._ledger.recover(self._stream.visible())
 
     # -------------------------------------------------------------- accessors
     @property
@@ -211,6 +214,9 @@ class LineSupervisor:
 
     def _declare_unit_modules(self, unit: str) -> None:
         """Declare every parameter and sequence a unit needs."""
+        # Parameter writes in an operating scope also withdraw confirmations
+        # issued for the gate that guards it.
+        self._ledger.link(self._feed.scope(unit), scope_key("feed_gate", unit))
         self._seal.declare_unit(unit)
         self._lube.declare_unit(unit)
         self._drive.declare_unit(unit)
